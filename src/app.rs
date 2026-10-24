@@ -3413,7 +3413,9 @@ impl App {
                     self.refresh_viewer_album(&chat);
                 }
                 if live && self.open_chat.as_deref() == Some(chat.as_str()) {
-                    if !older && (self.at_bottom || was_empty) {
+                    // A pending target wins over automatic bottom-follow,
+                    // including when this is the first page in the chat.
+                    if !older && self.scroll_anchor.is_none() && (self.at_bottom || was_empty) {
                         self.scroll_to_bottom = true;
                     }
                     if bare {
@@ -19654,6 +19656,125 @@ mod tests {
         assert_eq!(app.open_chat.as_deref(), Some(chat));
         assert_eq!(app.scroll_anchor.as_deref(), Some("old"));
         assert!(!app.scroll_to_bottom, "aims at the hit, not the end");
+    }
+
+    #[test]
+    fn first_page_for_a_search_hit_keeps_its_scroll_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(AppDirs::under(directory.path()), Settings::default());
+        let (backend, _commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        let chat = "search-result@s.whatsapp.net";
+        app.chats
+            .push(Chat::new(chat.into(), "Search result".into()));
+
+        app.apply(
+            Action::OpenMessage {
+                chat: chat.into(),
+                message: "hit".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(app.scroll_anchor.as_deref(), Some("hit"));
+        assert!(!app.scroll_to_bottom);
+
+        events
+            .send(Event::Messages {
+                chat: chat.into(),
+                messages: vec![message(chat, "hit", 100)],
+                older: false,
+                complete: true,
+            })
+            .unwrap();
+        app.handle_events();
+
+        assert!(app.conversations[chat].message("hit").is_some());
+        assert_eq!(app.scroll_anchor.as_deref(), Some("hit"));
+        assert!(
+            !app.scroll_to_bottom,
+            "the first page must not replace the search target with the chat end"
+        );
+    }
+
+    #[test]
+    fn search_hit_anchor_survives_a_first_page_that_needs_load_until() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(AppDirs::under(directory.path()), Settings::default());
+        let (backend, mut commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        let chat = "older-search-result@s.whatsapp.net";
+        app.chats
+            .push(Chat::new(chat.into(), "Older search result".into()));
+        app.apply(
+            Action::OpenMessage {
+                chat: chat.into(),
+                message: "older-hit".into(),
+            },
+            &ctx,
+        );
+
+        events
+            .send(Event::Messages {
+                chat: chat.into(),
+                messages: vec![message(chat, "newest-loaded", 200)],
+                older: false,
+                complete: false,
+            })
+            .unwrap();
+        app.handle_events();
+        assert_eq!(app.scroll_anchor.as_deref(), Some("older-hit"));
+        assert!(
+            !app.scroll_to_bottom,
+            "a first page that lacks the target must keep the pending jump"
+        );
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(
+            command,
+            Command::LoadUntil { chat: requested, id, before }
+                if requested == chat && id == "older-hit" && before == (200, "newest-loaded".into())
+        )));
+
+        events
+            .send(Event::Messages {
+                chat: chat.into(),
+                messages: vec![message(chat, "older-hit", 100)],
+                older: true,
+                complete: true,
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(app.conversations[chat].message("older-hit").is_some());
+        assert_eq!(app.scroll_anchor.as_deref(), Some("older-hit"));
+        assert!(!app.scroll_to_bottom);
+    }
+
+    #[test]
+    fn ordinary_open_chat_keeps_following_the_first_page_bottom() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(AppDirs::under(directory.path()), Settings::default());
+        let (backend, _commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        let chat = "ordinary-open@s.whatsapp.net";
+        app.chats
+            .push(Chat::new(chat.into(), "Ordinary open".into()));
+
+        app.apply(Action::OpenChat(chat.into()), &ctx);
+        assert!(app.scroll_anchor.is_none());
+        assert!(app.scroll_to_bottom);
+        events
+            .send(Event::Messages {
+                chat: chat.into(),
+                messages: vec![message(chat, "latest", 100)],
+                older: false,
+                complete: true,
+            })
+            .unwrap();
+        app.handle_events();
+
+        assert!(app.scroll_to_bottom);
+        assert!(app.scroll_anchor.is_none());
     }
 
     #[test]
